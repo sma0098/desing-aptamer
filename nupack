@@ -1,0 +1,153 @@
+from nupack import *
+import random
+import numpy as np
+from collections import defaultdict
+
+# ==================== Main settings ====================
+NUM_APTAMERS   = ........
+OUTPUT_FILE    = "..............fasta"
+TEMP_CELSIUS   = ...........
+APTAMER_LENGTH = ........
+GC_RANGE       = [0.45, 0.65]          # min / max GC fraction
+
+# ==================== Helper functions ====================
+def gc_content(seq: str) -> float:
+    """Return GC fraction of a sequence."""
+    return (seq.count('G') + seq.count('C')) / len(seq)
+
+
+def generate_stem_loop(length: int) -> str:
+    """Generate a simple stem-loop (hairpin) structure."""
+    stem_len = random.randint(4, min(8, (length - 6) // 2))
+    loop_len = length - 2 * stem_len
+    return '(' * stem_len + '.' * loop_len + ')' * stem_len
+
+
+def generate_pseudoknot(length: int) -> str:
+    """Generate a simple H-type pseudoknot."""
+    stem1 = random.randint(4, min(10, length // 3))
+    stem2 = random.randint(3, stem1 - 1)
+    loop  = length - 2 * stem1 - 2 * stem2
+    if loop < 4:                     # guarantee a minimum loop
+        stem1 = (length - 4) // 3
+        stem2 = stem1 - 1
+        loop  = length - 2 * stem1 - 2 * stem2
+    return '(' * stem1 + '[' * stem2 + '.' * loop + ']' * stem2 + ')' * stem1
+
+
+def generate_multi_branch(length: int) -> str:
+    """Generate a two-branch junction (very simple multi-branch)."""
+    stems = []
+    remaining = length
+    for _ in range(2):
+        stem = random.randint(3, remaining // 4)
+        stems.append(stem)
+        remaining -= 2 * stem
+    structure = ''
+    for stem in stems:
+        branch = random.randint(3, remaining)
+        structure += '(' * stem + '.' * branch + ')' * stem
+        remaining -= branch
+    return structure + '.' * remaining
+
+
+def compute_structure_energy(seq: str, struct: str, model: Model) -> float:
+    """
+    Return ΔG (kcal/mol) for a given sequence & secondary structure.
+    Uses NUPACK's `structure_energy` utility.
+    """
+    return structure_energy(strands=[seq], structure=struct, model=model)
+
+
+# ==================== Design library ====================
+model = Model(material='dna', celsius=TEMP_CELSIUS)
+
+library = []                     # (id, sequence, structure, ΔG)
+structure_counts = defaultdict(int)
+
+for i in range(1, NUM_APTAMERS + 1):
+    success = False
+    for attempt in range(3):                     # up to 3 retries per aptamer
+        try:
+            # 1. Choose motif
+            motif = random.choice(['stem_loop', 'pseudoknot', 'multi_branch'])
+            structure_counts[motif] += 1
+
+            # 2. Generate target secondary structure
+            if motif == 'stem_loop':
+                target_struct = generate_stem_loop(APTAMER_LENGTH)
+            elif motif == 'pseudoknot':
+                target_struct = generate_pseudoknot(APTAMER_LENGTH)
+            else:
+                target_struct = generate_multi_branch(APTAMER_LENGTH)
+
+            # 3. Define domain / strand / complex
+            dom     = Domain(f'N{APTAMER_LENGTH}', name=f'Dom_{i}')
+            strand  = TargetStrand([dom], name=f'Strand_{i}')
+            complex = TargetComplex([strand],
+                                    structure=target_struct,
+                                    name=f'Complex_{i}')
+
+            # 4. Design constraints
+            constraints = [
+                Similarity([dom], f'S{APTAMER_LENGTH}', limits=GC_RANGE),
+                Diversity(word=4, types=3),
+                Pattern(['AAAA', 'TTTT', 'CCCC', 'GGGG'], scope=strand)
+            ]
+
+            # 5. Run tube_design
+            design = tube_design(
+                tubes=[TargetTube(on_targets={complex: 1e-6}, name=f'Tube_{i}')],
+                model=model,
+                hard_constraints=constraints,
+                options=DesignOptions(
+                    f_stop=0.03,
+                    M_reopt=3,
+                    seed=42 + i
+                )
+            )
+
+            result = design.run(trials=1)[0]
+
+            # 6. Extract designed sequence (works for NUPACK ≥4.0)
+            seq = str(result.to_analysis(strand))
+
+            # 7. Verify GC range (extra safety)
+            if not (GC_RANGE[0] <= gc_content(seq) <= GC_RANGE[1]):
+                raise ValueError("GC out of range")
+
+            # 8. Compute ΔG for the *target* structure
+            dG = compute_structure_energy(seq, target_struct, model)
+
+            library.append((f"Aptamer_{i:03d}", seq, target_struct, dG))
+            print(f"Success Aptamer {i:03d} ({motif}): {target_struct}  ΔG = {dG:.2f} kcal/mol")
+            success = True
+            break
+
+        except Exception as e:
+            if attempt == 2:          # final attempt failed
+                print(f"Warning Failed Aptamer {i}: {e}")
+                # fallback: all-N placeholder
+                library.append((f"Aptamer_{i:03d}",
+                                "N" * APTAMER_LENGTH,
+                                "." * APTAMER_LENGTH,
+                                0.0))
+
+    if not success:
+        structure_counts['failed'] += 1
+
+# ==================== Write FASTA ====================
+with open(OUTPUT_FILE, 'w') as f:
+    for apt_id, seq, struct, dG in library:
+        f.write(f">{apt_id} | Structure: {struct} | ΔG: {dG:.2f} kcal/mol\n")
+        f.write(f"{seq}\n")
+
+# ==================== Final report ====================
+successful = len([x for x in library if 'N' not in x[1]])
+print("\n=== FINAL STATISTICS ===")
+print(f"- Successful designs : {successful}/{NUM_APTAMERS}")
+print(f"- Stem-loop          : {structure_counts['stem_loop']}")
+print(f"- Pseudoknot         : {structure_counts['pseudoknot']}")
+print(f"- Multi-branch       : {structure_counts['multi_branch']}")
+print(f"- Failed placeholders: {structure_counts.get('failed', 0)}")
+print(f"\nOutput written to: {OUTPUT_FILE}")
